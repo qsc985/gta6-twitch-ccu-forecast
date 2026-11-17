@@ -19,30 +19,38 @@ while the US - the largest market - unlocks at 05:00 UTC (East) and 08:00
 UTC (West), so viewership dips in the small hours and climbs steeply
 through the US day, peaking in the US afternoon / Europe evening.
 
-So the reference class is the comparables that share that pattern:
-console-only (PlayStation / Xbox / Switch, no PC at launch) and not
-early-access contaminated. For each such launch we take its launch-day
-curve, and for each hour h compute the log-ratio to its own hour 1,
-r_h = log(viewers_h / viewers_1). The forecast for hour h is then
+Only seven usable comparables share that pattern, so a median over
+just those is noisy: with six launches left after holding one out, a
+single launch can still move an hour's centre. The fix is to use every
+usable comparable but weight it by how much it shares the pattern:
+for each hour h, take every launch's log-ratio to its own hour 1,
+r_h = log(viewers_h / viewers_1), and centre the forecast on their
+weighted median, console-only launches at weight 1.0 and the rest at
+0.6. The console launches still dominate the shape (their combined
+weight beats the rest), but the other thirty launches steady the
+estimate. The spread s_h is the weighted dispersion of r_h around that
+median, with the same weights, after trimming the top and bottom 10% -
+a few launches have hour-1 prints in the hundreds, and their wild
+ratios would otherwise inflate the interval - floored at 0.30 and
+capped at 0.60. The forecast for hour h is then
 
     q_tau(h) = p1 * exp(m_h + z_tau * s_h)
 
-where m_h is the median of r_h across the reference launches (a robust
-centre that no single launch can drag), s_h is the population standard
-deviation of r_h across them (floored at 0.30, capped at 0.60, so the
-interval reflects how much comparable launches actually vary), and z_tau
-is the standard normal quantile at each scored level. This is a lognormal
+where m_h is that weighted median, s_h that trimmed spread, and z_tau
+the standard normal quantile at each scored level. This is a lognormal
 predictive distribution centred on the comparable-launch shape, anchored
 on the one number the case actually gives us (hour 1's print).
 
-Validation (leave-one-out over the 37 comparables in the kit, pinball
-loss on the log scale, lower is better; the starter's persistence
-baseline is 0.46 overall and 0.17 on console-only targets):
-  - this method on console-only targets: 0.11 (about a third better
-    than persistence on the launches shaped like this one)
-  - median over all comparables on console-only targets: 0.19 (worse
-    than persistence - mixing in PC-simultaneous launches, whose hour 1
-    is already high, flattens the shape and misses the US-unlock surge)
+Validation (leave-one-out over the 37 usable comparables in the kit,
+pinball loss on the log scale with the competition's factor 2, lower is
+better; the starter's persistence baseline is 0.93 overall and 0.34 on
+console-only targets):
+  - this method on console-only targets: 0.21 (about 40% better than
+    persistence on the launches shaped like this one)
+  - this method over all targets: 0.83 (persistence: 0.93)
+  - the previous console-only-only version: 0.22 on console-only
+    targets, 0.87 overall (an earlier note quoted these halved, 0.11 /
+    0.17, having left the factor 2 out of the pinball loss)
 
 Fallbacks keep the output valid whatever the case holds: if fewer than
 three console-only comparables are usable, all comparables are used; if
@@ -63,9 +71,8 @@ MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output.
 import json
 import math
 import os
-import statistics
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 # The grader's -P leaves /bot off sys.path: put it back first, so a module
@@ -84,6 +91,13 @@ SIGMA_PERSIST = 0.15
 # Floors / caps for the cross-launch spread of log-ratios.
 SIGMA_FLOOR = 0.30
 SIGMA_CAP = 0.60
+# Weight of a non-console-only comparable in the per-hour weighted median:
+# console-only launches count 1.0, the rest 0.6, so the shape stays
+# console-led while the other launches steady the estimate.
+WEIGHT_OTHER = 0.6
+# Fraction trimmed from each tail of the log-ratios before the spread is
+# taken, so a few wild ratios (tiny hour-1 prints) cannot inflate it.
+TRIM_FRAC = 0.10
 # A comparable needs hour 1 plus at least this many launch-day hours.
 MIN_HOURS = 15
 # Need at least this many console-only comparables, else use them all.
@@ -153,13 +167,51 @@ def reference_curves(case: dict) -> list[tuple[dict[int, float], bool]]:
     return curves
 
 
-def hour_quantiles(p1: float, h: int, log_ratios: list[float]) -> list[float | int]:
-    """Quantiles for hour h from the cross-launch log-ratios of that hour."""
-    if not log_ratios:
+def weighted_median(pairs: list[tuple[float, float]]) -> float:
+    """Median of values with weights: the value where the cumulative
+    weight first reaches half the total. Deterministic; no randomness,
+    so two runs of the entry produce the same bytes."""
+    total = sum(w for _, w in pairs)
+    acc = 0.0
+    for value, _weight in sorted(pairs):
+        acc += _weight
+        if acc >= total / 2:
+            return value
+    return sorted(pairs)[-1][0]
+
+
+def weighted_trimmed_sd(pairs: list[tuple[float, float]], centre: float, frac: float = TRIM_FRAC) -> float:
+    """Weighted population sd of (value - centre) after trimming frac
+    from each tail by value, so a few wild log-ratios cannot inflate the
+    spread. The dispersion is measured around the centre actually used
+    (the weighted median) and with the same weights, so the interval
+    reflects the spread of the launches the forecast is centred on.
+    Too few values to trim: the plain weighted sd (or the floor)."""
+    devs = sorted((value - centre, weight) for value, weight in pairs)
+    n = len(devs)
+    k = int(n * frac)
+    if n - 2 * k >= 2:
+        devs = devs[k:n - k]
+    total = sum(w for _, w in devs)
+    if total <= 0:
+        return SIGMA_FLOOR
+    var = sum(w * d * d for d, w in devs) / total
+    return math.sqrt(var)
+
+
+def hour_quantiles(p1: float, h: int, ratios: list[tuple[float, float]]) -> list[float | int]:
+    """Quantiles for hour h from the cross-launch log-ratios of that hour.
+
+    ratios carries (log-ratio, weight) per launch: the centre is the
+    weighted median (console-only launches at weight 1.0, the rest 0.6)
+    and the spread is the 10%-trimmed weighted dispersion of the
+    log-ratios around that median.
+    """
+    if not ratios:
         # No reference data for this hour: starter persistence.
         return [round2(p1 * math.exp(z * SIGMA_PERSIST * math.sqrt(h - 1))) for z in Z]
-    med = statistics.median(log_ratios)
-    sd = statistics.pstdev(log_ratios) if len(log_ratios) > 1 else SIGMA_FLOOR
+    med = weighted_median(ratios)
+    sd = weighted_trimmed_sd(ratios, med)
     sd = min(max(sd, SIGMA_FLOOR), SIGMA_CAP)
     out = []
     prev = 0.0
@@ -185,23 +237,29 @@ def forecast_case(case: dict, name: str) -> dict:
     p1 = max(1.0, float(first["viewers"]))
 
     curves = reference_curves(case)
-    console = [c for c in curves if c[1]]
-    # The reference class: console-only launches like this one; fall back
-    # to all comparables if too few of them are usable.
-    ref = console if len(console) >= MIN_CONSOLE else [c[0] for c in curves]
-    ref_hours = [c[0] if isinstance(c, tuple) else c for c in ref]
+    console = [c[0] for c in curves if c[1]]
+    others = [c[0] for c in curves if not c[1]]
+    # The reference class: console-only launches lead, the rest steady the
+    # estimate at weight 0.6. If too few console-only launches are usable,
+    # every comparable counts equally.
+    if len(console) < MIN_CONSOLE:
+        console, others = console + others, []
 
     hours = []
     for row in case.get("forecast") or [{"hour": h} for h in range(2, 25)]:
         h = int(row["hour"])
         if not 2 <= h <= 24:
             continue
-        log_ratios = [
-            math.log(hours[h] / hours[1])
-            for hours in ref_hours
+        ratios = [
+            (math.log(hours[h] / hours[1]), 1.0)
+            for hours in console
+            if 1 in hours and h in hours and hours[1] > 0 and hours[h] > 0
+        ] + [
+            (math.log(hours[h] / hours[1]), WEIGHT_OTHER)
+            for hours in others
             if 1 in hours and h in hours and hours[1] > 0 and hours[h] > 0
         ]
-        hours.append({"hour": h, "q": hour_quantiles(p1, h, log_ratios)})
+        hours.append({"hour": h, "q": hour_quantiles(p1, h, ratios)})
     if len(hours) != 23:
         raise ValueError(f"{name}: forecast has {len(hours)} rows, expected 23")
     return {"hours": hours}
